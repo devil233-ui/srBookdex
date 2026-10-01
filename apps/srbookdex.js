@@ -8,6 +8,7 @@ import {
 import { loadIndex, channelEntries, channelStats, totalItems, ensureDirs } from '../lib/srbookdex/base.js'
 import { updateChannel, loadItem, findEntryByName } from '../lib/srbookdex/fetchers.js'
 import { formatFetchError, searchChannelContent } from '../lib/srbookdex/wiki-api.js'
+import { searchBwiki, formatBwikiError } from '../lib/srbookdex/bwiki.js'
 import { buildItemNodes, splitTextPages } from '../lib/srbookdex/render.js'
 import { loadConfig, getDefaultAutoUpdateInfo, AUTO_UPDATE_HOUR_GMT8 } from '../lib/srbookdex/config.js'
 import { startWebUi, getWebUiInfo } from '../lib/srbookdex/webui.js'
@@ -316,11 +317,32 @@ export class SrBookdex extends plugin {
       }
       if (hits.length >= 30) break
     }
-    if (!hits.length) return this.reply(`没有找到「${keyword}」，可以用 *<分类>更新 拉取数据，或在网页里搜索全文`)
+    if (!hits.length) return this.replyBwikiFallback(keyword)
     saveSession(this.e, { channelKey: hits[0].channelKey, items: hits.map(item => ({ id: item.id, name: item.name, channelKey: item.channelKey })) })
     const lines = hits.map((item, i) => `${i + 1}. [${item.channelName}] ${item.name}`)
     await this.reply(`搜索「${keyword}」：找到 ${hits.length} 条`)
     return this.replyLong(lines.join('\n'))
+  }
+
+  /**
+   * 米游社文本库没有命中时的兜底：去 bwiki（B站 wiki）检索。
+   * 只给词条链接与摘要——bwiki 的正文是模板拼出来的，抓下来一半是导航，不如让用户点进去看。
+   */
+  async replyBwikiFallback(keyword) {
+    let result = null
+    try {
+      result = await searchBwiki('sr', keyword)
+    } catch (error) {
+      globalThis.logger?.warn?.('[srBookdex] bwiki 兜底检索失败', error?.message || error)
+      return this.reply(`米游社文本库里没有「${keyword}」，bwiki 兜底检索也失败了：${formatBwikiError(error)}，可稍后重试`)
+    }
+    if (!result.hits.length) return this.reply(`没有找到「${keyword}」：米游社文本库和 bwiki 都没有相关条目`)
+    await this.reply(`米游社文本库里没有「${keyword}」，bwiki 上有 ${result.total} 条，以下是前 ${result.hits.length} 条：`)
+    const lines = result.hits.map((hit, i) => {
+      const snippet = hit.snippet ? `\n  ↳ ${hit.snippet}` : ''
+      return `${i + 1}. ${hit.title}${snippet}\n  🔗 ${hit.url}`
+    })
+    return this.replyFolded(lines)
   }
 
   /** `*<分类> <关键词>`：在该分类里按名字找（引号括号会被忽略） */
