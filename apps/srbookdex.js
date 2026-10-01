@@ -7,7 +7,7 @@ import {
 import { loadIndex, channelEntries, channelStats, totalItems, ensureDirs } from '../lib/srbookdex/base.js'
 import { updateChannel, loadItem, findEntryByName } from '../lib/srbookdex/fetchers.js'
 import { formatFetchError, searchChannelContent } from '../lib/srbookdex/wiki-api.js'
-import { buildItemText } from '../lib/srbookdex/render.js'
+import { buildItemText, extractImages, splitTextPages } from '../lib/srbookdex/render.js'
 import { loadConfig, getDefaultAutoUpdateInfo, AUTO_UPDATE_HOUR_GMT8 } from '../lib/srbookdex/config.js'
 import { startWebUi, getWebUiInfo } from '../lib/srbookdex/webui.js'
 
@@ -44,6 +44,24 @@ function readSession(e) {
   }
   return session
 }
+
+/** 关键词归一化：去掉引号/括号/空白，便于「灯塔」和「「灯塔」」都能匹配 */
+function normalizeKeyword(value) {
+  return String(value || '')
+    .replace(/[「」『』“”"'’‘《》()（）\s]/g, '')
+    .trim()
+}
+
+/** 把「名字图片」这类后缀拆掉 */
+function splitOutputSuffix(value) {
+  const raw = String(value || '').trim()
+  const match = raw.match(/^(.*?)(图片|文本|语音)?$/)
+  return { keyword: (match?.[1] || raw).trim(), wantImage: match?.[2] === '图片' }
+}
+
+/** 默认带几张图（敌人弱点是图标，不带上就看不出弱点） */
+const DEFAULT_IMAGES = 6
+const MAX_IMAGES = 15
 
 export class SrBookdex extends plugin {
   constructor() {
@@ -83,6 +101,10 @@ export class SrBookdex extends plugin {
         {
           reg: `^${PREFIX}(图鉴网页|网页|web)$`,
           fnc: 'showWebUi'
+        },
+        {
+          reg: `^${PREFIX}(${NAME_PATTERN})\\s+(.+)$`,
+          fnc: 'categoryLookup'
         },
         {
           reg: `^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`,
@@ -125,17 +147,41 @@ export class SrBookdex extends plugin {
     }
   }
 
-  async replyLong(text, imageUrl = '') {
-    const content = String(text || '').trim() || '（没有可用文本）'
-    const chunks = []
-    for (let i = 0; i < content.length; i += REPLY_LIMIT) chunks.push(content.slice(i, i + REPLY_LIMIT))
-    if (imageUrl && chunks.length) chunks[0] = `[icon]${chunks[0]}`
-    for (const chunk of chunks.slice(0, 6)) {
-      const image = chunk.startsWith('[icon]') ? globalThis.segment?.image?.(imageUrl) : null
-      const body = chunk.replace(/^\[icon\]/, '')
-      await this.reply(image ? [body, image] : body)
+  /** 长文本用合并转发折叠，短文本直接发；列表与正文都走这里 */
+  async replyFolded(lines) {
+    const list = (lines || []).map(item => String(item || '').trim()).filter(Boolean)
+    if (!list.length) return true
+    if (list.length === 1 && list[0].length <= REPLY_LIMIT) return this.reply(list[0])
+    try {
+      const forward = globalThis.Bot?.makeForwardArray ? await globalThis.Bot.makeForwardArray(list) : null
+      if (forward) return this.reply(forward)
+    } catch (error) {
+      globalThis.logger?.warn?.('[srBookdex] 合并转发失败，改为直接发送', error?.message || error)
     }
-    if (chunks.length > 6) await this.reply(`内容较长，已省略后续 ${chunks.length - 6} 段；可用网页或 *搜索 查看完整内容`)
+    for (const line of list.slice(0, 6)) await this.reply(line)
+    if (list.length > 6) await this.reply(`内容较长，已折叠前 6 段（共 ${list.length} 段）`)
+    return true
+  }
+
+  async replyLong(text, imageUrl = '') {
+    return this.replyFolded(splitTextPages(text, REPLY_LIMIT))
+  }
+
+  /** 回复一个条目的正文：正文折叠 + 图片（默认带少量，图片后缀带更多） */
+  async replyItem(item, { wantImage = false } = {}) {
+    const text = buildItemText(item)
+    const images = [...new Set(extractImages((item.sections || []).map(section => section.html || '').join('\n')))]
+    const limit = wantImage ? MAX_IMAGES : DEFAULT_IMAGES
+    const picked = images.slice(0, limit)
+
+    const nodes = [`【${item.channelName}】${item.name}`, item.url, ...splitTextPages(text, REPLY_LIMIT)]
+    if (images.length > picked.length) nodes.push(`本文共 ${images.length} 张图，已附前 ${picked.length} 张；要全部图片请发 *${item.name}图片`)
+    await this.replyFolded(nodes)
+
+    if (picked.length) {
+      const segments = picked.map(url => globalThis.segment?.image?.(url)).filter(Boolean)
+      if (segments.length) await this.reply(segments)
+    }
     return true
   }
 
@@ -258,6 +304,34 @@ export class SrBookdex extends plugin {
     return this.replyLong(lines.join('\n'))
   }
 
+  /** `*<分类> <关键词>`：在该分类里按名字找（引号括号会被忽略） */
+  async categoryLookup() {
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(${NAME_PATTERN})\\s+(.+)$`))
+    const channel = match && findChannelByName(match[1])
+    if (!channel) return false
+    const { keyword, wantImage } = splitOutputSuffix(match[2])
+    if (!keyword) return false
+    const index = await loadIndex()
+    const found = findEntryByName(index, channel.key, keyword)
+    if (found && !found.ambiguous) return this.readItemByChannel(channel.key, found.id, wantImage)
+    if (found?.ambiguous?.length) {
+      saveSession(this.e, { channelKey: channel.key, items: found.ambiguous.map(item => ({ id: item.id, name: item.name })) })
+      const lines = found.ambiguous.map((item, i) => `${i + 1}. ${item.name}`)
+      await this.reply(`${channel.name}里匹配到 ${found.ambiguous.length} 条，发送 *<序号> 选择：`)
+      return this.replyFolded(lines)
+    }
+    // 本地没有就退回米游社的分类内搜索
+    try {
+      const list = await searchChannelContent(channel.id, keyword, { limit: 10 })
+      if (!list.length) return this.reply(`${channel.name}里没有找到「${keyword}」`)
+      saveSession(this.e, { channelKey: channel.key, items: list.map(item => ({ id: item.id, name: item.name })) })
+      await this.reply(`${channel.name}搜索「${keyword}」：找到 ${list.length} 条，发送 *<序号> 查看`)
+      return this.replyFolded(list.map((item, i) => `${i + 1}. ${item.name}`))
+    } catch (error) {
+      return this.reply(`查找失败：${formatFetchError(error)}`)
+    }
+  }
+
   async pickByIndex() {
     const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`))
     if (!match) return false
@@ -266,12 +340,12 @@ export class SrBookdex extends plugin {
     const index = Number(match[1]) - 1
     const target = session.items[index]
     if (!target) return this.reply(`序号超出范围（当前列表共 ${session.items.length} 条）`)
-    return this.readItemByChannel(target.channelKey || session.channelKey, target.id)
+    return this.readItemByChannel(target.channelKey || session.channelKey, target.id, match[2] === '图片')
   }
 
   async pickByTitle() {
     const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(.+)$`))
-    const keyword = String(match?.[1] || '').trim()
+    const { keyword, wantImage } = splitOutputSuffix(String(match?.[1] || '').trim())
     if (!keyword) return false
     // 保留字：避免把 *更新 之类的残留当成条目名
     if (/^(更新|强制更新|帮助|搜索|统一更新|全部更新|同步更新)$/.test(keyword)) return false
@@ -279,24 +353,22 @@ export class SrBookdex extends plugin {
     const index = await loadIndex()
     for (const channel of ACTIVE_CHANNELS) {
       const found = findEntryByName(index, channel.key, keyword)
-      if (found && !found.ambiguous) return this.readItemByChannel(channel.key, found.id)
+      if (found && !found.ambiguous) return this.readItemByChannel(channel.key, found.id, wantImage)
       if (found?.ambiguous?.length) {
         saveSession(this.e, { channelKey: channel.key, items: found.ambiguous.map(item => ({ id: item.id, name: item.name })) })
         const lines = found.ambiguous.map((item, i) => `${i + 1}. ${item.name}`)
         await this.reply(`在${channel.name}里匹配到多条，发送 *<序号> 选择：`)
-        return this.replyLong(lines.join('\n'))
+        return this.replyFolded(lines)
       }
     }
     // 找不到就静默返回 false，把消息让给后面的插件（例如喵喵的 *面板 / *卡片 这类命令）
     return false
   }
 
-  async readItemByChannel(channelKey, id) {
+  async readItemByChannel(channelKey, id, wantImage = false) {
     const item = await loadItem(channelKey, id)
     if (!item) return this.reply('这条内容还没有下载到本地，可以先执行对应分类的更新')
-    const text = buildItemText(item)
-    await this.reply(`【${item.channelName}】${item.name}\n${item.url}`)
-    return this.replyLong(text, item.icon || '')
+    return this.replyItem(item, { wantImage })
   }
 
   /* ── 网页 ─────────────────────────────────────────────── */
