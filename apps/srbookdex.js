@@ -67,7 +67,7 @@ const FORWARD_BATCH = 6
 export class SrBookdex extends plugin {
   constructor() {
     super({
-      name: '星穹铁道文本图鉴（srBookdex）',
+      name: '星穹铁道文本图鉴（srBookdex-plugin）',
       dsc: '崩坏：星穹铁道米游社 wiki 的文本检索与阅读（阅读物 / 任务 / 角色 / 光锥 / 遗器 / 道具材料）',
       event: 'message',
       priority: 5000,

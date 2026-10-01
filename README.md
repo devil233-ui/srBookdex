@@ -1,4 +1,4 @@
-# srBookdex（星穹铁道文本图鉴）
+# srBookdex-plugin（星穹铁道文本图鉴）
 
 米游社崩坏：星穹铁道 wiki 的文本检索与阅读插件，配合 [bookdex-plugin](https://github.com/KexinyingLife/bookdex-plugin)（原神）使用。
 
