@@ -1,0 +1,11 @@
+{
+  "name": "srbookdex",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "星穹铁道文本图鉴（srBookdex）：米游社崩铁 wiki 的文本检索与阅读插件",
+  "main": "index.js",
+  "scripts": {
+    "check": "node --check apps/srbookdex.js"
+  },
+  "dependencies": {}
+}
