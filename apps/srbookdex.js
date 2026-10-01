@@ -13,6 +13,12 @@ import { startWebUi, getWebUiInfo } from '../lib/srbookdex/webui.js'
 
 /** 已启用分类的名字与别名（长的在前），用于生成指令正则 */
 const NAME_PATTERN = buildNamePattern()
+/**
+ * 指令前缀。
+ * 注意：云崽的 loader 会把 `*` 开头的消息标准化成 `#星铁…`（srReg），全角 `＊` 不在此列，
+ * 所以这里两种形式都要认，否则在群里发 `*阅读物帮助` 会被框架改写成 `#星铁阅读物帮助` 后匹配不到。
+ */
+const PREFIX = '(?:#?星铁\\s*|[*＊])'
 /** 单条回复的字符上限 */
 const REPLY_LIMIT = 1500
 /** 序号会话有效期（毫秒） */
@@ -48,42 +54,42 @@ export class SrBookdex extends plugin {
       priority: 5000,
       rule: [
         {
-          reg: `^[*＊](${NAME_PATTERN})强制更新$`,
+          reg: `^${PREFIX}(${NAME_PATTERN})强制更新$`,
           fnc: 'forceUpdateChannel',
           permission: 'master'
         },
         {
-          reg: `^[*＊](${NAME_PATTERN})更新$`,
+          reg: `^${PREFIX}(${NAME_PATTERN})更新$`,
           fnc: 'updateChannelCommand',
           permission: 'master'
         },
         {
-          reg: `^[*＊](${NAME_PATTERN})帮助\\d*$`,
+          reg: `^${PREFIX}(${NAME_PATTERN})帮助\\d*$`,
           fnc: 'channelHelp'
         },
         {
-          reg: `^[*＊](${NAME_PATTERN})搜索\\s*(.+)$`,
+          reg: `^${PREFIX}(${NAME_PATTERN})搜索\\s*(.+)$`,
           fnc: 'channelSearch'
         },
         {
-          reg: '^[*＊](统一更新|全部更新|同步更新)$',
+          reg: `^${PREFIX}(统一更新|全部更新|同步更新)$`,
           fnc: 'updateAllCommand',
           permission: 'master'
         },
         {
-          reg: '^[*＊]搜索\\s*(.+)$',
+          reg: `^${PREFIX}搜索\\s*(.+)$`,
           fnc: 'searchAll'
         },
         {
-          reg: '^[*＊](图鉴网页|网页|web)$',
+          reg: `^${PREFIX}(图鉴网页|网页|web)$`,
           fnc: 'showWebUi'
         },
         {
-          reg: '^[*＊](\\d{1,4})\\s*(文本|图片)?$',
+          reg: `^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`,
           fnc: 'pickByIndex'
         },
         {
-          reg: '^[*＊](.+)$',
+          reg: `^${PREFIX}(.+)$`,
           fnc: 'pickByTitle'
         }
       ]
@@ -147,7 +153,7 @@ export class SrBookdex extends plugin {
   /* ── 更新指令 ─────────────────────────────────────────── */
 
   async updateChannelCommand() {
-    const match = String(this.e.msg || '').match(new RegExp(`^[*＊](${NAME_PATTERN})更新$`))
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(${NAME_PATTERN})更新$`))
     const channel = match && findChannelByName(match[1])
     if (!channel) return this.reply('没有识别到分类，用法如：*阅读物更新、*光锥强制更新')
     await this.reply(`开始更新${channel.name}（增量），请稍等…`)
@@ -162,7 +168,7 @@ export class SrBookdex extends plugin {
   }
 
   async forceUpdateChannel() {
-    const match = String(this.e.msg || '').match(new RegExp(`^[*＊](${NAME_PATTERN})强制更新$`))
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(${NAME_PATTERN})强制更新$`))
     const channel = match && findChannelByName(match[1])
     if (!channel) return this.reply('没有识别到分类，用法如：*阅读物强制更新')
     await this.reply(`开始强制核对${channel.name}：逐条读取米游社详情并与本地比对，条目多时较慢，请稍等…`)
@@ -194,7 +200,7 @@ export class SrBookdex extends plugin {
   /* ── 帮助 / 搜索 / 阅读 ───────────────────────────────── */
 
   async channelHelp() {
-    const match = String(this.e.msg || '').match(new RegExp(`^[*＊](${NAME_PATTERN})帮助(\\d*)$`))
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(${NAME_PATTERN})帮助(\\d*)$`))
     const channel = match && findChannelByName(match[1])
     if (!channel) return this.reply('没有识别到分类，用法如：*阅读物帮助')
     const page = Math.max(1, Number(match[2] || 1))
@@ -214,7 +220,7 @@ export class SrBookdex extends plugin {
   }
 
   async channelSearch() {
-    const match = String(this.e.msg || '').match(new RegExp(`^[*＊](${NAME_PATTERN})搜索\\s*(.+)$`))
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(${NAME_PATTERN})搜索\\s*(.+)$`))
     const channel = match && findChannelByName(match[1])
     const keyword = String(match?.[2] || '').trim()
     if (!channel || !keyword) return this.reply('用法如：*阅读物搜索 冷笑话')
@@ -231,7 +237,7 @@ export class SrBookdex extends plugin {
   }
 
   async searchAll() {
-    const match = String(this.e.msg || '').match(/^[*＊]搜索\s*(.+)$/)
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}搜索\\s*(.+)$`))
     const keyword = String(match?.[1] || '').trim()
     if (!keyword) return this.reply('用法如：*搜索 冷笑话')
     const index = await loadIndex()
@@ -253,7 +259,7 @@ export class SrBookdex extends plugin {
   }
 
   async pickByIndex() {
-    const match = String(this.e.msg || '').match(/^[*＊](\d{1,4})\s*(文本|图片)?$/)
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`))
     if (!match) return false
     const session = readSession(this.e)
     if (!session?.items?.length) return false
@@ -264,11 +270,12 @@ export class SrBookdex extends plugin {
   }
 
   async pickByTitle() {
-    const match = String(this.e.msg || '').match(/^[*＊](.+)$/)
+    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(.+)$`))
     const keyword = String(match?.[1] || '').trim()
     if (!keyword) return false
     // 保留字：避免把 *更新 之类的残留当成条目名
     if (/^(更新|强制更新|帮助|搜索|统一更新|全部更新|同步更新)$/.test(keyword)) return false
+
     const index = await loadIndex()
     for (const channel of ACTIVE_CHANNELS) {
       const found = findEntryByName(index, channel.key, keyword)
@@ -280,7 +287,8 @@ export class SrBookdex extends plugin {
         return this.replyLong(lines.join('\n'))
       }
     }
-    return this.reply(`没有找到「${keyword}」，可以先用 *<分类>更新 拉取数据`)
+    // 找不到就静默返回 false，把消息让给后面的插件（例如喵喵的 *面板 / *卡片 这类命令）
+    return false
   }
 
   async readItemByChannel(channelKey, id) {
