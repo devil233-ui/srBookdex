@@ -2,12 +2,13 @@ import fss from 'node:fs'
 import {
   ACTIVE_CHANNELS,
   buildNamePattern,
+  channelNames,
   findChannelByName
 } from '../lib/srbookdex/channels.js'
 import { loadIndex, channelEntries, channelStats, totalItems, ensureDirs } from '../lib/srbookdex/base.js'
 import { updateChannel, loadItem, findEntryByName } from '../lib/srbookdex/fetchers.js'
 import { formatFetchError, searchChannelContent } from '../lib/srbookdex/wiki-api.js'
-import { buildItemText, extractImages, splitTextPages } from '../lib/srbookdex/render.js'
+import { buildItemNodes, splitTextPages } from '../lib/srbookdex/render.js'
 import { loadConfig, getDefaultAutoUpdateInfo, AUTO_UPDATE_HOUR_GMT8 } from '../lib/srbookdex/config.js'
 import { startWebUi, getWebUiInfo } from '../lib/srbookdex/webui.js'
 
@@ -20,7 +21,6 @@ const NAME_PATTERN = buildNamePattern()
  */
 const PREFIX = '(?:#?星铁\\s*|[*＊])'
 /** 单条回复的字符上限 */
-const REPLY_LIMIT = 1500
 /** 序号会话有效期（毫秒） */
 const SESSION_TTL = 60 * 60 * 1000
 
@@ -59,9 +59,9 @@ function splitOutputSuffix(value) {
   return { keyword: (match?.[1] || raw).trim(), wantImage: match?.[2] === '图片' }
 }
 
-/** 默认带几张图（敌人弱点是图标，不带上就看不出弱点） */
-const DEFAULT_IMAGES = 6
-const MAX_IMAGES = 15
+/** 合并转发的分页与分批（与 bookdex 保持一致） */
+const PAGE_CHARS = 800
+const FORWARD_BATCH = 6
 
 export class SrBookdex extends plugin {
   constructor() {
@@ -147,42 +147,61 @@ export class SrBookdex extends plugin {
     }
   }
 
-  /** 长文本用合并转发折叠，短文本直接发；列表与正文都走这里 */
-  async replyFolded(lines) {
-    const list = (lines || []).map(item => String(item || '').trim()).filter(Boolean)
+  /**
+   * 把有序节点（文字页 / 图片）按批转成合并转发；一批最多 FORWARD_BATCH 段。
+   * 转发失败时退回直接发送，保证内容一定发得出去。
+   */
+  async replyNodes(nodes) {
+    const list = (nodes || []).filter(node => node && (node.type === 'image' ? Boolean(node.url) : String(node.text || '').trim()))
     if (!list.length) return true
-    if (list.length === 1 && list[0].length <= REPLY_LIMIT) return this.reply(list[0])
-    try {
-      const forward = globalThis.Bot?.makeForwardArray ? await globalThis.Bot.makeForwardArray(list) : null
-      if (forward) return this.reply(forward)
-    } catch (error) {
-      globalThis.logger?.warn?.('[srBookdex] 合并转发失败，改为直接发送', error?.message || error)
+
+    if (list.length === 1 && list[0].type === 'text') return this.reply(list[0].text)
+
+    let allOk = true
+    for (let i = 0; i < list.length; i += FORWARD_BATCH) {
+      const batch = list.slice(i, i + FORWARD_BATCH)
+      const messages = batch.map(node => {
+        if (node.type !== 'image') return node.text
+        const segment = globalThis.segment?.image?.(node.url)
+        return segment ? [segment] : ''
+      }).filter(Boolean)
+      try {
+        const forward = globalThis.Bot?.makeForwardArray ? await globalThis.Bot.makeForwardArray(messages) : null
+        if (!forward) throw new Error('Bot.makeForwardArray 不可用')
+        await this.reply(forward)
+      } catch (error) {
+        allOk = false
+        globalThis.logger?.warn?.('[srBookdex] 合并转发失败，改为直接发送', error?.message || error)
+        for (const node of batch) {
+          if (node.type === 'image') {
+            const segment = globalThis.segment?.image?.(node.url)
+            if (segment) await this.reply(segment)
+          } else {
+            await this.reply(node.text)
+          }
+        }
+      }
     }
-    for (const line of list.slice(0, 6)) await this.reply(line)
-    if (list.length > 6) await this.reply(`内容较长，已折叠前 6 段（共 ${list.length} 段）`)
-    return true
+    return allOk
   }
 
-  async replyLong(text, imageUrl = '') {
-    return this.replyFolded(splitTextPages(text, REPLY_LIMIT))
+  /** 文字列表（帮助 / 搜索结果）用合并转发折叠 */
+  async replyFolded(lines) {
+    const nodes = []
+    for (const line of (lines || []).map(item => String(item || '').trim()).filter(Boolean)) {
+      for (const page of splitTextPages(line, PAGE_CHARS)) nodes.push({ type: 'text', text: page })
+    }
+    return this.replyNodes(nodes)
   }
 
-  /** 回复一个条目的正文：正文折叠 + 图片（默认带少量，图片后缀带更多） */
-  async replyItem(item, { wantImage = false } = {}) {
-    const text = buildItemText(item)
-    const images = [...new Set(extractImages((item.sections || []).map(section => section.html || '').join('\n')))]
-    const limit = wantImage ? MAX_IMAGES : DEFAULT_IMAGES
-    const picked = images.slice(0, limit)
-
-    const nodes = [`【${item.channelName}】${item.name}`, item.url, ...splitTextPages(text, REPLY_LIMIT)]
-    if (images.length > picked.length) nodes.push(`本文共 ${images.length} 张图，已附前 ${picked.length} 张；要全部图片请发 *${item.name}图片`)
-    await this.replyFolded(nodes)
-
-    if (picked.length) {
-      const segments = picked.map(url => globalThis.segment?.image?.(url)).filter(Boolean)
-      if (segments.length) await this.reply(segments)
-    }
-    return true
+  /**
+   * 回复条目：标题与链接单独发（不进折叠），正文按原始顺序折叠，图片内联在正文里。
+   */
+  async replyItem(item) {
+    await this.reply(`【${item.channelName}】${item.name}\n${item.url}`)
+    const nodes = buildItemNodes(item, { pageChars: PAGE_CHARS })
+    if (!nodes.length) return this.reply('（这条没有可用正文）')
+    return this.replyNodes(nodes)
   }
 
   async replySummary(results, title) {
@@ -309,11 +328,11 @@ export class SrBookdex extends plugin {
     const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(${NAME_PATTERN})\\s+(.+)$`))
     const channel = match && findChannelByName(match[1])
     if (!channel) return false
-    const { keyword, wantImage } = splitOutputSuffix(match[2])
+    const { keyword } = splitOutputSuffix(match[2])
     if (!keyword) return false
     const index = await loadIndex()
     const found = findEntryByName(index, channel.key, keyword)
-    if (found && !found.ambiguous) return this.readItemByChannel(channel.key, found.id, wantImage)
+    if (found && !found.ambiguous) return this.readItemByChannel(channel.key, found.id)
     if (found?.ambiguous?.length) {
       saveSession(this.e, { channelKey: channel.key, items: found.ambiguous.map(item => ({ id: item.id, name: item.name })) })
       const lines = found.ambiguous.map((item, i) => `${i + 1}. ${item.name}`)
@@ -343,32 +362,93 @@ export class SrBookdex extends plugin {
     return this.readItemByChannel(target.channelKey || session.channelKey, target.id, match[2] === '图片')
   }
 
+  /** 分类名 + 关键词 写成一体时拆开（*敌对物种「灯塔」/ *敌人 灯塔 / *阅读物 冷笑话） */
+  splitCategoryPrefix(raw) {
+    const text = String(raw || '').trim()
+    if (!text) return null
+    const candidates = []
+    for (const channel of ACTIVE_CHANNELS) {
+      for (const name of channelNames(channel)) {
+        if (text.startsWith(name)) candidates.push({ channel, name })
+      }
+    }
+    const best = candidates.sort((a, b) => b.name.length - a.name.length)[0]
+    if (!best) return null
+    const keyword = text.slice(best.name.length).trim()
+    return keyword ? { channel: best.channel, keyword } : null
+  }
+
+  /**
+   * 全局按名字找：先精确（忽略引号括号空白），再包含。
+   * 包含匹配取名字最短的那条，避免 `*灯塔` 被「在灯塔的光芒下」抢走。
+   */
+  async findGlobal(keyword) {
+    const index = await loadIndex()
+    const norm = value => String(value || '').replace(/[「」『』“”"'’‘《》()（）\s]/g, '').toLowerCase()
+    const target = norm(keyword)
+    if (!target) return null
+    const exact = []
+    const partial = []
+    for (const channel of ACTIVE_CHANNELS) {
+      for (const item of channelEntries(index, channel.key)) {
+        const name = norm(item.name)
+        if (name === target) exact.push({ channel, item })
+        else if (name.includes(target)) partial.push({ channel, item })
+      }
+    }
+    if (exact.length === 1) return { channel: exact[0].channel, item: exact[0].item }
+    if (exact.length > 1) return { ambiguous: exact.slice(0, 15) }
+    partial.sort((a, b) => String(a.item.name).length - String(b.item.name).length)
+    if (!partial.length) return null
+    const shortest = String(partial[0].item.name).length
+    const best = partial.filter(entry => String(entry.item.name).length === shortest)
+    if (best.length === 1) return { channel: best[0].channel, item: best[0].item }
+    return { ambiguous: partial.slice(0, 15) }
+  }
+
+  async replyAmbiguous(entries, scopeName = '') {
+    const key = entries[0]?.channel?.key || ''
+    saveSession(this.e, {
+      channelKey: key,
+      items: entries.map(entry => ({ id: entry.item.id, name: entry.item.name, channelKey: entry.channel.key }))
+    })
+    const lines = entries.map((entry, i) => `${i + 1}. [${entry.channel.name}] ${entry.item.name}`)
+    await this.reply(`${scopeName ? `${scopeName}里` : ''}匹配到 ${entries.length} 条，发送 *<序号> 选择：`)
+    return this.replyFolded(lines)
+  }
+
   async pickByTitle() {
     const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(.+)$`))
-    const { keyword, wantImage } = splitOutputSuffix(String(match?.[1] || '').trim())
+    const { keyword: rawKeyword } = splitOutputSuffix(String(match?.[1] || '').trim())
+    const keyword = rawKeyword.trim()
     if (!keyword) return false
     // 保留字：避免把 *更新 之类的残留当成条目名
     if (/^(更新|强制更新|帮助|搜索|统一更新|全部更新|同步更新)$/.test(keyword)) return false
 
-    const index = await loadIndex()
-    for (const channel of ACTIVE_CHANNELS) {
-      const found = findEntryByName(index, channel.key, keyword)
-      if (found && !found.ambiguous) return this.readItemByChannel(channel.key, found.id, wantImage)
+    // 1) 「分类名 + 关键词」写成一体（*敌对物种「灯塔」这种没空格的写法）
+    const scoped = this.splitCategoryPrefix(keyword)
+    if (scoped) {
+      const index = await loadIndex()
+      const found = findEntryByName(index, scoped.channel.key, scoped.keyword)
+      if (found && !found.ambiguous) return this.readItemByChannel(scoped.channel.key, found.id)
       if (found?.ambiguous?.length) {
-        saveSession(this.e, { channelKey: channel.key, items: found.ambiguous.map(item => ({ id: item.id, name: item.name })) })
-        const lines = found.ambiguous.map((item, i) => `${i + 1}. ${item.name}`)
-        await this.reply(`在${channel.name}里匹配到多条，发送 *<序号> 选择：`)
-        return this.replyFolded(lines)
+        return this.replyAmbiguous(found.ambiguous.map(item => ({ channel: scoped.channel, item })), scoped.channel.name)
       }
     }
+
+    // 2) 全局按名字找
+    const hit = await this.findGlobal(scoped?.keyword || keyword)
+    if (hit?.item) return this.readItemByChannel(hit.channel.key, hit.item.id)
+    if (hit?.ambiguous?.length) return this.replyAmbiguous(hit.ambiguous)
+
     // 找不到就静默返回 false，把消息让给后面的插件（例如喵喵的 *面板 / *卡片 这类命令）
     return false
   }
 
-  async readItemByChannel(channelKey, id, wantImage = false) {
+  async readItemByChannel(channelKey, id) {
     const item = await loadItem(channelKey, id)
     if (!item) return this.reply('这条内容还没有下载到本地，可以先执行对应分类的更新')
-    return this.replyItem(item, { wantImage })
+    return this.replyItem(item)
   }
 
   /* ── 网页 ─────────────────────────────────────────────── */
