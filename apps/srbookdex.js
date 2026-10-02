@@ -282,7 +282,7 @@ export class SrBookdex extends plugin {
 
     const lines = slice.map((item, i) => `${(current - 1) * pageSize + i + 1}. ${item.name}`)
     await this.reply(`${channel.name}（共 ${entries.length} 条，第 ${current}/${totalPages} 页）\n发送 *<序号> 查看内容，如 *1；翻页用 *${channel.name}帮助${current + 1}`)
-    return this.replyLong(lines.join('\n'))
+    return this.replyFolded(lines)
   }
 
   async channelSearch() {
@@ -296,7 +296,7 @@ export class SrBookdex extends plugin {
       saveSession(this.e, { channelKey: channel.key, items: list.map(item => ({ id: item.id, name: item.name })) })
       const lines = list.map((item, i) => `${i + 1}. ${item.name}${item.summary ? `（${item.summary}）` : ''}`)
       await this.reply(`${channel.name}搜索「${keyword}」：找到 ${list.length} 条`)
-      return this.replyLong(lines.join('\n'))
+      return this.replyFolded(lines)
     } catch (error) {
       return this.reply(`搜索失败：${formatFetchError(error)}`)
     }
@@ -321,7 +321,7 @@ export class SrBookdex extends plugin {
     saveSession(this.e, { channelKey: hits[0].channelKey, items: hits.map(item => ({ id: item.id, name: item.name, channelKey: item.channelKey })) })
     const lines = hits.map((item, i) => `${i + 1}. [${item.channelName}] ${item.name}`)
     await this.reply(`搜索「${keyword}」：找到 ${hits.length} 条`)
-    return this.replyLong(lines.join('\n'))
+    return this.replyFolded(lines)
   }
 
   /**
