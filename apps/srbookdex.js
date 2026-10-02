@@ -26,26 +26,68 @@ const PREFIX = '(?:#?星铁\\s*|[*＊])'
 const SESSION_TTL = 60 * 60 * 1000
 
 const sessions = new Map()
+/** 每个用户保留最近几条列表会话：引用旧列表发序号时还能找回对应列表 */
+const SESSION_KEEP = 8
 
 function sessionKey(e) {
   return `${e?.group_id || 'private'}:${e?.user_id || 'unknown'}`
 }
 
-function saveSession(e, payload) {
-  sessions.set(sessionKey(e), { ...payload, at: Date.now() })
-  return sessions.get(sessionKey(e))
+function liveSessions(e) {
+  const list = (sessions.get(sessionKey(e)) || []).filter(session => session && Date.now() - session.at <= SESSION_TTL)
+  sessions.set(sessionKey(e), list)
+  return list
 }
 
-function readSession(e) {
-  const session = sessions.get(sessionKey(e))
-  if (!session) return null
-  if (Date.now() - session.at > SESSION_TTL) {
-    sessions.delete(sessionKey(e))
-    return null
-  }
+function saveSession(e, payload) {
+  const session = { ...payload, messageIds: [], at: Date.now() }
+  const list = liveSessions(e)
+  list.push(session)
+  sessions.set(sessionKey(e), list.slice(-SESSION_KEEP))
   return session
 }
 
+function readSession(e) {
+  const list = liveSessions(e)
+  return list.length ? list[list.length - 1] : null
+}
+
+/** 记下机器人自己发出的消息 id：用户「引用列表发序号」靠它找回会话 */
+function rememberReply(session, res) {
+  if (!session) return session
+  const ids = Array.isArray(res?.message_id) ? res.message_id : (res?.message_id ? [res.message_id] : [])
+  if (!ids.length) return session
+  session.messageIds = [...new Set([...(session.messageIds || []), ...ids.map(String)])]
+  session.at = Date.now()
+  return session
+}
+
+/** 用户当前引用的消息 id（各适配器字段不同，取法和原神侧一致） */
+async function quotedMessageId(e) {
+  if (e?.reply_id) return String(e.reply_id)
+  if (e?.quote?.id) return String(e.quote.id)
+  if (e?.getReply) {
+    try {
+      const reply = await e.getReply()
+      if (reply?.message_id) return String(reply.message_id)
+    } catch { /* 拿不到就当没引用 */ }
+  }
+  return ''
+}
+
+/** 引用的正好是本插件发过的列表 → 返回那个会话，否则 null */
+async function sessionFromQuote(e) {
+  const id = await quotedMessageId(e)
+  if (!id) return null
+  const list = liveSessions(e)
+  for (let i = list.length - 1; i >= 0; i--) {
+    if ((list[i].messageIds || []).map(String).includes(id)) {
+      list[i].at = Date.now()
+      return list[i]
+    }
+  }
+  return null
+}
 /** 关键词归一化：去掉引号/括号/空白，便于「灯塔」和「「灯塔」」都能匹配 */
 function normalizeKeyword(value) {
   return String(value || '')
@@ -108,7 +150,7 @@ export class SrBookdex extends plugin {
           fnc: 'categoryLookup'
         },
         {
-          reg: `^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`,
+          reg: `^(?:${PREFIX}\\s*)?(\\d{1,4})\\s*(文本|图片)?$`,
           fnc: 'pickByIndex'
         },
         {
@@ -152,11 +194,11 @@ export class SrBookdex extends plugin {
    * 把有序节点（文字页 / 图片）按批转成合并转发；一批最多 FORWARD_BATCH 段。
    * 转发失败时退回直接发送，保证内容一定发得出去。
    */
-  async replyNodes(nodes) {
+  async replyNodes(nodes, session = null) {
     const list = (nodes || []).filter(node => node && (node.type === 'image' ? Boolean(node.url) : String(node.text || '').trim()))
     if (!list.length) return true
 
-    if (list.length === 1 && list[0].type === 'text') return this.reply(list[0].text)
+    if (list.length === 1 && list[0].type === 'text') return rememberReply(session, await this.reply(list[0].text))
 
     let allOk = true
     for (let i = 0; i < list.length; i += FORWARD_BATCH) {
@@ -169,16 +211,16 @@ export class SrBookdex extends plugin {
       try {
         const forward = globalThis.Bot?.makeForwardArray ? await globalThis.Bot.makeForwardArray(messages) : null
         if (!forward) throw new Error('Bot.makeForwardArray 不可用')
-        await this.reply(forward)
+        rememberReply(session, await this.reply(forward))
       } catch (error) {
         allOk = false
         globalThis.logger?.warn?.('[srBookdex] 合并转发失败，改为直接发送', error?.message || error)
         for (const node of batch) {
           if (node.type === 'image') {
             const segment = globalThis.segment?.image?.(node.url)
-            if (segment) await this.reply(segment)
+            if (segment) rememberReply(session, await this.reply(segment))
           } else {
-            await this.reply(node.text)
+            rememberReply(session, await this.reply(node.text))
           }
         }
       }
@@ -186,13 +228,13 @@ export class SrBookdex extends plugin {
     return allOk
   }
 
-  /** 文字列表（帮助 / 搜索结果）用合并转发折叠 */
-  async replyFolded(lines) {
+  /** 文字列表（帮助 / 搜索结果）用合并转发折叠；session 用来记下消息 id，供「引用列表发序号」 */
+  async replyFolded(lines, session = null) {
     const nodes = []
     for (const line of (lines || []).map(item => String(item || '').trim()).filter(Boolean)) {
       for (const page of splitTextPages(line, PAGE_CHARS)) nodes.push({ type: 'text', text: page })
     }
-    return this.replyNodes(nodes)
+    return this.replyNodes(nodes, session)
   }
 
   /**
@@ -278,11 +320,11 @@ export class SrBookdex extends plugin {
     const totalPages = Math.max(1, Math.ceil(entries.length / pageSize))
     const current = Math.min(page, totalPages)
     const slice = entries.slice((current - 1) * pageSize, current * pageSize)
-    saveSession(this.e, { channelKey: channel.key, items: slice.map(item => ({ id: item.id, name: item.name })) })
+    const session = saveSession(this.e, { channelKey: channel.key, items: slice.map(item => ({ id: item.id, name: item.name })) })
 
     const lines = slice.map((item, i) => `${(current - 1) * pageSize + i + 1}. ${item.name}`)
-    await this.reply(`${channel.name}（共 ${entries.length} 条，第 ${current}/${totalPages} 页）\n发送 *<序号> 查看内容，如 *1；翻页用 *${channel.name}帮助${current + 1}`)
-    return this.replyFolded(lines)
+    rememberReply(session, await this.reply(`${channel.name}（共 ${entries.length} 条，第 ${current}/${totalPages} 页）\n引用本条后发序号即可查看内容（可加“图片”）；翻页用 *${channel.name}帮助${current + 1}`))
+    return this.replyFolded(lines, session)
   }
 
   async channelSearch() {
@@ -293,15 +335,14 @@ export class SrBookdex extends plugin {
     try {
       const list = await searchChannelContent(channel.id, keyword, { limit: 20 })
       if (!list.length) return this.reply(`在${channel.name}里没有搜到「${keyword}」`)
-      saveSession(this.e, { channelKey: channel.key, items: list.map(item => ({ id: item.id, name: item.name })) })
+      const session = saveSession(this.e, { channelKey: channel.key, items: list.map(item => ({ id: item.id, name: item.name })) })
       const lines = list.map((item, i) => `${i + 1}. ${item.name}${item.summary ? `（${item.summary}）` : ''}`)
-      await this.reply(`${channel.name}搜索「${keyword}」：找到 ${list.length} 条`)
-      return this.replyFolded(lines)
+      rememberReply(session, await this.reply(`${channel.name}搜索「${keyword}」：找到 ${list.length} 条\n引用本条后发序号即可查看内容（可加“图片”）`))
+      return this.replyFolded(lines, session)
     } catch (error) {
       return this.reply(`搜索失败：${formatFetchError(error)}`)
     }
   }
-
   async searchAll() {
     const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}搜索\\s*(.+)$`))
     const keyword = String(match?.[1] || '').trim()
@@ -318,10 +359,10 @@ export class SrBookdex extends plugin {
       if (hits.length >= 30) break
     }
     if (!hits.length) return this.replyBwikiFallback(keyword)
-    saveSession(this.e, { channelKey: hits[0].channelKey, items: hits.map(item => ({ id: item.id, name: item.name, channelKey: item.channelKey })) })
+    const session = saveSession(this.e, { channelKey: hits[0].channelKey, items: hits.map(item => ({ id: item.id, name: item.name, channelKey: item.channelKey })) })
     const lines = hits.map((item, i) => `${i + 1}. [${item.channelName}] ${item.name}`)
-    await this.reply(`搜索「${keyword}」：找到 ${hits.length} 条`)
-    return this.replyFolded(lines)
+    rememberReply(session, await this.reply(`搜索「${keyword}」：找到 ${hits.length} 条\n引用本条后发序号即可查看内容（可加“图片”）`))
+    return this.replyFolded(lines, session)
   }
 
   /**
@@ -373,17 +414,26 @@ export class SrBookdex extends plugin {
     }
   }
 
+  /**
+   * 序号查看：
+   * - 引用本插件发过的列表后再发纯数字（可加“图片”）→ 按被引用的那条列表取；
+   * - 直接发 *<序号> → 用该用户最近一次的列表（有引用时引用优先）。
+   * 纯数字必须带引用，否则会把群里别人的数字消息吃掉。
+   */
   async pickByIndex() {
-    const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`))
-    if (!match) return false
-    const session = readSession(this.e)
+    const raw = String(this.e.msg || '').trim()
+    const normalized = raw.replace(/[０-９]/g, ch => String(ch.charCodeAt(0) - 65248))
+    const prefixed = normalized.match(new RegExp(`^${PREFIX}(\\d{1,4})\\s*(文本|图片)?$`))
+    const bare = prefixed ? null : normalized.match(/^(\d{1,4})\s*(文本|图片)?$/)
+    if (!prefixed && !bare) return false
+
+    const index = Number((prefixed || bare)[1]) - 1
+    const session = await sessionFromQuote(this.e) || (prefixed ? readSession(this.e) : null)
     if (!session?.items?.length) return false
-    const index = Number(match[1]) - 1
     const target = session.items[index]
     if (!target) return this.reply(`序号超出范围（当前列表共 ${session.items.length} 条）`)
-    return this.readItemByChannel(target.channelKey || session.channelKey, target.id, match[2] === '图片')
+    return this.readItemByChannel(target.channelKey || session.channelKey, target.id)
   }
-
   /** 分类名 + 关键词 写成一体时拆开（*敌对物种「灯塔」/ *敌人 灯塔 / *阅读物 冷笑话） */
   splitCategoryPrefix(raw) {
     const text = String(raw || '').trim()
@@ -430,15 +480,14 @@ export class SrBookdex extends plugin {
 
   async replyAmbiguous(entries, scopeName = '') {
     const key = entries[0]?.channel?.key || ''
-    saveSession(this.e, {
+    const session = saveSession(this.e, {
       channelKey: key,
       items: entries.map(entry => ({ id: entry.item.id, name: entry.item.name, channelKey: entry.channel.key }))
     })
     const lines = entries.map((entry, i) => `${i + 1}. [${entry.channel.name}] ${entry.item.name}`)
-    await this.reply(`${scopeName ? `${scopeName}里` : ''}匹配到 ${entries.length} 条，发送 *<序号> 选择：`)
-    return this.replyFolded(lines)
+    rememberReply(session, await this.reply(`${scopeName ? `${scopeName}里` : ''}匹配到 ${entries.length} 条，引用本条后发序号选择：`))
+    return this.replyFolded(lines, session)
   }
-
   async pickByTitle() {
     const match = String(this.e.msg || '').match(new RegExp(`^${PREFIX}(.+)$`))
     const { keyword: rawKeyword } = splitOutputSuffix(String(match?.[1] || '').trim())
