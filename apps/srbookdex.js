@@ -12,6 +12,7 @@ import { searchBwiki, formatBwikiError } from '../lib/srbookdex/bwiki.js'
 import { buildItemNodes, splitTextPages } from '../lib/srbookdex/render.js'
 import { loadConfig, getDefaultAutoUpdateInfo, AUTO_UPDATE_HOUR_GMT8 } from '../lib/srbookdex/config.js'
 import { startWebUi, getWebUiInfo } from '../lib/srbookdex/webui.js'
+import { pluginDir, path } from '../lib/srbookdex/paths.js'
 
 /** 已启用分类的名字与别名（长的在前），用于生成指令正则 */
 const NAME_PATTERN = buildNamePattern()
@@ -125,6 +126,10 @@ export class SrBookdex extends plugin {
           permission: 'master'
         },
         {
+          reg: `^${PREFIX}(书角图鉴帮助|书籍图鉴帮助|srbookdex帮助)$`,
+          fnc: 'totalHelp'
+        },
+        {
           reg: `^${PREFIX}(${NAME_PATTERN})帮助\\d*$`,
           fnc: 'channelHelp'
         },
@@ -133,7 +138,7 @@ export class SrBookdex extends plugin {
           fnc: 'channelSearch'
         },
         {
-          reg: `^${PREFIX}(统一更新|全部更新|同步更新)$`,
+          reg: `^${PREFIX}(统一更新|全部更新|同步更新|书籍图鉴更新)$`,
           fnc: 'updateAllCommand',
           permission: 'master'
         },
@@ -142,7 +147,7 @@ export class SrBookdex extends plugin {
           fnc: 'searchAll'
         },
         {
-          reg: `^${PREFIX}(图鉴网页|网页|web)$`,
+          reg: `^${PREFIX}(图鉴网页|网页|web|书籍图鉴网页)$`,
           fnc: 'showWebUi'
         },
         {
@@ -523,6 +528,15 @@ export class SrBookdex extends plugin {
   }
 
   /* ── 网页 ─────────────────────────────────────────────── */
+
+  /** 总帮助图：对齐原神侧的 #书籍图鉴帮助 */
+  async totalHelp() {
+    const helpImg = path.join(pluginDir, 'resources', 'help-main.jpg')
+    if (!fss.existsSync(helpImg)) return this.reply('总帮助图缺失，请重新安装或更新插件资源')
+    const image = globalThis.segment?.image?.(`file://${helpImg}`)
+    if (!image) return this.reply(`总帮助图：${helpImg}`)
+    return this.reply(image)
+  }
 
   async showWebUi() {
     const info = getWebUiInfo() || await startWebUi({ logger: globalThis.logger })
